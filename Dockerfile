@@ -10,10 +10,6 @@ RUN apk add --no-cache \
     python3 \
     tzdata
 
-ENV \
-    DEBEZIUM_URL=http://hi-event-dw-pipeline-staging.hifpt.svc.cluster.local:8083 \
-    CURL_INSECURE=false
-
 COPY scripts/.healthzc /app/scripts/.healthzc
 
 RUN chmod +x /app/scripts/.healthzc
