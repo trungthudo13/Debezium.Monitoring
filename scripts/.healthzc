@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+
+HEALTHZC_LOG_TAG="${HEALTHZC_LOG_TAG:-debezium-healthzc}"
+DEBEZIUM_URL="${DEBEZIUM_URL:-}"
+HEALTHZC_CURL_TIMEOUT="${HEALTHZC_CURL_TIMEOUT:-10}"
+CURL_INSECURE="${CURL_INSECURE:-false}"
+CONNECTOR_RESTART_DELAY="${CONNECTOR_RESTART_DELAY:-10}"
+
+_healthzc_is_sourced() {
+  if [[ -n "${ZSH_EVAL_CONTEXT:-}" ]]; then
+    [[ "${ZSH_EVAL_CONTEXT}" == *:file ]]
+    return
+  fi
+
+  [[ "${BASH_SOURCE[0]:-}" != "$0" ]]
+}
+
+_healthzc_finish() {
+  local exit_code="${1:-0}"
+
+  if _healthzc_is_sourced; then
+    return "${exit_code}"
+  fi
+
+  exit "${exit_code}"
+}
+
+_healthzc_log() {
+  local level="$1"
+  shift
+
+  local message="$*"
+  local timestamp
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  if [[ "${level}" == "ERROR" || "${level}" == "WARN" ]]; then
+    printf '[%s] [%s] %s\n' "${timestamp}" "${level}" "${message}" >&2
+  else
+    printf '[%s] [%s] %s\n' "${timestamp}" "${level}" "${message}"
+  fi
+
+  if command -v logger >/dev/null 2>&1; then
+    logger -t "${HEALTHZC_LOG_TAG}" -- "[${level}] ${message}" 2>/dev/null || true
+  fi
+}
+
+_healthzc_require_dependencies() {
+  if ! command -v curl >/dev/null 2>&1; then
+    _healthzc_log ERROR "Missing required dependency: curl"
+    return 1
+  fi
+
+  if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+    _healthzc_log ERROR "Missing JSON parser. Install jq or python3."
+    return 1
+  fi
+
+  return 0
+}
+
+_healthzc_urlencode() {
+  local raw="$1"
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -rn --arg value "${raw}" '$value|@uri'
+    return
+  fi
+
+  python3 - "${raw}" <<'PY'
+import sys
+from urllib.parse import quote
+
+print(quote(sys.argv[1], safe=""))
+PY
+}
+
+_healthzc_json_query() {
+  local json_input="$1"
+  local jq_expr="$2"
+  local python_expr="$3"
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "${json_input}" | jq -r "${jq_expr}"
+    return
+  fi
+
+  JSON_INPUT="${json_input}" PYTHON_EXPR="${python_expr}" python3 - <<'PY'
+import json
+import os
+import sys
+
+data = json.loads(os.environ["JSON_INPUT"])
+expr = os.environ["PYTHON_EXPR"]
+namespace = {"data": data}
+result = eval(expr, {"__builtins__": {}}, namespace)
+
+if result is None:
+    pass
+elif isinstance(result, list):
+    for item in result:
+        if item is None:
+            continue
+        print(item)
+else:
+    print(result)
+PY
+}
+
+_healthzc_get_proxy() {
+  case "${DEBEZIUM_URL}" in
+    https://*)
+      printf '%s' "${https_proxy:-${HTTPS_PROXY:-}}"
+      ;;
+    http://*)
+      printf '%s' "${http_proxy:-${HTTP_PROXY:-}}"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+_healthzc_get_host() {
+  local url="$1"
+  local host
+
+  host="${url#*://}"
+  host="${host%%/*}"
+  host="${host%%:*}"
+
+  printf '%s' "${host}"
+}
+
+_healthzc_should_bypass_proxy() {
+  local host
+  local no_proxy_list
+  local entry
+  local normalized_entry
+
+  host="$(_healthzc_get_host "${DEBEZIUM_URL}")"
+  no_proxy_list="${no_proxy:-${NO_PROXY:-}}"
+
+  [[ -z "${host}" || -z "${no_proxy_list}" ]] && return 1
+
+  local old_ifs="${IFS}"
+  IFS=','
+  for entry in ${no_proxy_list}; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "${entry}" ]] && continue
+
+    if [[ "${entry}" == "*" ]]; then
+      IFS="${old_ifs}"
+      return 0
+    fi
+
+    normalized_entry="${entry#.}"
+    normalized_entry="${normalized_entry%%:*}"
+
+    if [[ "${host}" == "${normalized_entry}" || "${host}" == *".${normalized_entry}" ]]; then
+      IFS="${old_ifs}"
+      return 0
+    fi
+  done
+  IFS="${old_ifs}"
+
+  return 1
+}
+
+_healthzc_fetch() {
+  local endpoint="$1"
+  local proxy_url
+  local -a curl_args
+
+  curl_args=(
+    -fsS
+    --location
+    --max-time "${HEALTHZC_CURL_TIMEOUT}"
+  )
+
+  case "${CURL_INSECURE}" in
+    1|true|TRUE|yes|YES|on|ON)
+      curl_args+=(-k)
+      ;;
+  esac
+
+  if ! _healthzc_should_bypass_proxy; then
+    proxy_url="$(_healthzc_get_proxy)"
+  fi
+
+  if [[ -n "${proxy_url}" ]]; then
+    curl_args+=(--proxy "${proxy_url}")
+  fi
+
+  curl "${curl_args[@]}" "${DEBEZIUM_URL%/}${endpoint}"
+}
+
+_healthzc_request() {
+  local method="$1"
+  local endpoint="$2"
+  local proxy_url
+  local -a curl_args
+
+  curl_args=(
+    -fsS
+    --location
+    --max-time "${HEALTHZC_CURL_TIMEOUT}"
+    -X "${method}"
+  )
+
+  case "${CURL_INSECURE}" in
+    1|true|TRUE|yes|YES|on|ON)
+      curl_args+=(-k)
+      ;;
+  esac
+
+  if ! _healthzc_should_bypass_proxy; then
+    proxy_url="$(_healthzc_get_proxy)"
+  fi
+
+  if [[ -n "${proxy_url}" ]]; then
+    curl_args+=(--proxy "${proxy_url}")
+  fi
+
+  curl "${curl_args[@]}" "${DEBEZIUM_URL%/}${endpoint}"
+}
+
+_healthzc_emit_status_report() {
+  local connector_name="$1"
+  local connector_type="$2"
+  local status_json="$3"
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "${status_json}" | jq -r \
+      --arg connector_name "${connector_name}" \
+      --arg connector_type "${connector_type}" \
+      '
+      "Connector \($connector_name) (\($connector_type)) state=\(.connector.state // "UNKNOWN") worker=\(.connector.worker_id // "n/a")",
+      (.tasks[]? | "Task \(.id // "n/a") state=\(.state // "UNKNOWN") worker=\(.worker_id // "n/a")"),
+      (.tasks[]? | select(.trace != null and .trace != "") | (.trace | gsub("\r"; "") | split("\n")[]))
+      '
+    return
+  fi
+
+  STATUS_JSON="${status_json}" python3 - "${connector_name}" "${connector_type}" <<'PY'
+import json
+import os
+import sys
+
+status = json.loads(os.environ["STATUS_JSON"])
+connector_name = sys.argv[1]
+connector_type = sys.argv[2]
+
+connector_state = (status.get("connector") or {}).get("state", "UNKNOWN")
+connector_worker = (status.get("connector") or {}).get("worker_id", "n/a")
+
+print(f"Connector {connector_name} ({connector_type}) state={connector_state} worker={connector_worker}")
+
+for task in status.get("tasks", []):
+    task_id = task.get("id", "n/a")
+    task_state = task.get("state", "UNKNOWN")
+    worker_id = task.get("worker_id", "n/a")
+    print(f"Task {task_id} state={task_state} worker={worker_id}")
+    trace = task.get("trace")
+    if trace:
+        print("TRACE_START")
+        print(trace.rstrip())
+        print("TRACE_END")
+PY
+}
+
+_healthzc_status_has_failed_state() {
+  local status_json="$1"
+  local failed_count
+
+  failed_count="$(
+    _healthzc_json_query \
+      "${status_json}" \
+      '[.connector.state, (.tasks[]?.state // empty)] | map(select(. == "FAILED")) | length' \
+      'len([state for state in [(data.get("connector") or {}).get("state")] + [task.get("state") for task in data.get("tasks", [])] if state == "FAILED"])'
+  )"
+
+  [[ "${failed_count}" =~ ^[0-9]+$ ]] && [[ "${failed_count}" -gt 0 ]]
+}
+
+_healthzc_restart_connector() {
+  local connector_name="$1"
+  local encoded_name
+  local delay="${CONNECTOR_RESTART_DELAY}"
+
+  encoded_name="$(_healthzc_urlencode "${connector_name}")"
+
+  _healthzc_log WARN "Restarting connector ${connector_name} via stop/resume"
+
+  if ! _healthzc_request PUT "/connectors/${encoded_name}/stop" >/dev/null; then
+    _healthzc_log ERROR "Cannot stop connector ${connector_name}"
+    return 1
+  fi
+
+  if ! _healthzc_request PUT "/connectors/${encoded_name}/resume" >/dev/null; then
+    _healthzc_log ERROR "Cannot resume connector ${connector_name}"
+    return 1
+  fi
+
+  if [[ "${delay}" =~ ^[0-9]+$ ]] && [[ "${delay}" -gt 0 ]]; then
+    _healthzc_log INFO "Waiting ${delay}s before rechecking connector ${connector_name}"
+    sleep "${delay}"
+  fi
+
+  return 0
+}
+
+_healthzc_check_connector() {
+  local connector_name="$1"
+  local encoded_name
+  local info_json
+  local status_json
+  local connector_type
+  local connector_state
+  local unhealthy=0
+  local can_restart=0
+
+  encoded_name="$(_healthzc_urlencode "${connector_name}")"
+
+  if ! info_json="$(_healthzc_fetch "/connectors/${encoded_name}")"; then
+    _healthzc_log ERROR "Cannot fetch connector config for ${connector_name}"
+    return 1
+  fi
+
+  if ! status_json="$(_healthzc_fetch "/connectors/${encoded_name}/status")"; then
+    _healthzc_log ERROR "Cannot fetch connector status for ${connector_name}"
+    return 1
+  fi
+
+  connector_type="$(
+    _healthzc_json_query \
+      "${info_json}" \
+      '.type // (.config["connector.class"] // "unknown")' \
+      'data.get("type") or data.get("config", {}).get("connector.class") or "unknown"'
+  )"
+  connector_type="$(printf '%s' "${connector_type}" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "${connector_type}" != "source" && "${connector_type}" != "sink" ]]; then
+    _healthzc_log WARN "Skipping connector ${connector_name} with unsupported type ${connector_type}"
+    return 0
+  fi
+
+  connector_state="$(
+    _healthzc_json_query \
+      "${status_json}" \
+      '.connector.state // "UNKNOWN"' \
+      '(data.get("connector") or {}).get("state", "UNKNOWN")'
+  )"
+
+  if [[ "${connector_state}" != "RUNNING" ]]; then
+    unhealthy=1
+  fi
+
+  while IFS= read -r task_state; do
+    [[ -z "${task_state}" ]] && continue
+    if [[ "${task_state}" != "RUNNING" ]]; then
+      unhealthy=1
+      break
+    fi
+  done < <(
+    _healthzc_json_query \
+      "${status_json}" \
+      '.tasks[]?.state // empty' \
+      '[task.get("state", "UNKNOWN") for task in data.get("tasks", [])]'
+  )
+
+  if [[ "${unhealthy}" -eq 0 ]]; then
+    _healthzc_log INFO "Connector ${connector_name} (${connector_type}) healthy"
+    return 0
+  fi
+
+  _healthzc_log ERROR "Connector ${connector_name} (${connector_type}) is unhealthy"
+
+  while IFS= read -r report_line; do
+    [[ -z "${report_line}" ]] && continue
+
+    if [[ "${report_line}" == "TRACE_START" || "${report_line}" == "TRACE_END" ]]; then
+      continue
+    fi
+
+    _healthzc_log ERROR "${connector_name}: ${report_line}"
+  done < <(_healthzc_emit_status_report "${connector_name}" "${connector_type}" "${status_json}")
+
+  if _healthzc_status_has_failed_state "${status_json}"; then
+    can_restart=1
+  fi
+
+  if [[ "${can_restart}" -eq 0 ]]; then
+    return 1
+  fi
+
+  if ! _healthzc_restart_connector "${connector_name}"; then
+    return 1
+  fi
+
+  if ! status_json="$(_healthzc_fetch "/connectors/${encoded_name}/status")"; then
+    _healthzc_log ERROR "Cannot fetch connector status for ${connector_name} after restart"
+    return 1
+  fi
+
+  connector_state="$(
+    _healthzc_json_query \
+      "${status_json}" \
+      '.connector.state // "UNKNOWN"' \
+      '(data.get("connector") or {}).get("state", "UNKNOWN")'
+  )"
+
+  unhealthy=0
+  if [[ "${connector_state}" != "RUNNING" ]]; then
+    unhealthy=1
+  fi
+
+  while IFS= read -r task_state; do
+    [[ -z "${task_state}" ]] && continue
+    if [[ "${task_state}" != "RUNNING" ]]; then
+      unhealthy=1
+      break
+    fi
+  done < <(
+    _healthzc_json_query \
+      "${status_json}" \
+      '.tasks[]?.state // empty' \
+      '[task.get("state", "UNKNOWN") for task in data.get("tasks", [])]'
+  )
+
+  if [[ "${unhealthy}" -eq 0 ]]; then
+    _healthzc_log INFO "Connector ${connector_name} (${connector_type}) healthy after restart"
+    return 0
+  fi
+
+  _healthzc_log ERROR "Connector ${connector_name} (${connector_type}) is still unhealthy after restart"
+  while IFS= read -r report_line; do
+    [[ -z "${report_line}" ]] && continue
+    if [[ "${report_line}" == "TRACE_START" || "${report_line}" == "TRACE_END" ]]; then
+      continue
+    fi
+    _healthzc_log ERROR "${connector_name}: ${report_line}"
+  done < <(_healthzc_emit_status_report "${connector_name}" "${connector_type}" "${status_json}")
+
+  return 1
+}
+
+_healthzc_main() {
+  local connectors_json
+  local connectors=()
+  local has_failure=0
+
+  if ! _healthzc_require_dependencies; then
+    return 1
+  fi
+
+  if [[ -z "${DEBEZIUM_URL}" ]]; then
+    _healthzc_log ERROR "DEBEZIUM_URL is not set"
+    return 1
+  fi
+
+  if ! connectors_json="$(_healthzc_fetch "/connectors")"; then
+    _healthzc_log ERROR "Cannot fetch connectors from ${DEBEZIUM_URL}"
+    return 1
+  fi
+
+  while IFS= read -r connector_name; do
+    [[ -z "${connector_name}" ]] && continue
+    connectors+=("${connector_name}")
+  done < <(
+    _healthzc_json_query \
+      "${connectors_json}" \
+      '.[]' \
+      'data'
+  )
+
+  if [[ "${#connectors[@]}" -eq 0 ]]; then
+    _healthzc_log WARN "No connectors found at ${DEBEZIUM_URL}"
+    return 0
+  fi
+
+  _healthzc_log INFO "Checking ${#connectors[@]} connector(s) from ${DEBEZIUM_URL}"
+
+  for connector_name in "${connectors[@]}"; do
+    if ! _healthzc_check_connector "${connector_name}"; then
+      has_failure=1
+    fi
+  done
+
+  if [[ "${has_failure}" -ne 0 ]]; then
+    _healthzc_log ERROR "Debezium connector healthcheck failed"
+    return 1
+  fi
+
+  _healthzc_log INFO "Debezium connector healthcheck passed"
+  return 0
+}
+
+_healthzc_main
+_healthzc_finish $?
